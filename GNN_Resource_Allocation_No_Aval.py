@@ -1,10 +1,8 @@
 # ==============================================================================
-# PROJETO: Alocação de Recursos de Workflow com GNNs e PyTorch
-#
-# Abordagem: Modelo não-supervisionado com GNN Alocadora e GNN Avaliadora)
-# Baseado em: "Unsupervised Resource Allocation with GNNs" (Cranmer et al., 2021)
-#
+# MODIFIED CODE - SKIPS GNN_AVAL TRAINING
 # ==============================================================================
+
+# %% [Same cells 1-6, but skip training in cell 6]
 
 # %%
 # ==============================================================================
@@ -428,16 +426,8 @@ print(f"\nSaída Dummy GNN_Aval (shape): {pred.shape}")
 
 # %%
 # ==============================================================================
-# CÉLULA 6: Fase 1 - Pré-treinamento da GNN_Aval
+# CÉLULA 6: SKIP TRAINING - JUST LOAD PRETRAINED MODELS
 # ==============================================================================
-#
-# Objetivo: Ensinar a GNN_Aval a ser um bom simulador.
-#
-# 1. Gerar (Problema, Alocação) -> **MELHORIA: Usar heurísticas, não só aleatório**
-# 2. Calcular (Makespan Real, Custo Real) com o simulador (Célula 3)
-# 3. **MELHORIA: Normalizar (Makespan, Custo) para a loss ser estável**
-# 4. Treinar GNN_Aval(Problema + Alocação) para prever (Makespan Norm, Custo Norm)
-# 5. Loss: MSE
 #
 
 class TargetNormalizer:
@@ -482,205 +472,82 @@ class TargetNormalizer:
         self.var = state_dict['var']
         self.count = state_dict['count']
 
-def create_training_sample_for_aval(num_tasks_base, num_vms):
-    """Gera um único ponto de dados para o pré-treino da GNN_Aval."""
+def heuristic_random(dag, num_vms):
+    alloc_dict = {}
+    for node_id in dag.nodes():
+        vm_id = random.randint(0, num_vms - 1)
+        alloc_dict[node_id] = vm_id
+    return alloc_dict
 
-    # 1. Gerar Problema
-    num_tasks = num_tasks_base + random.randint(-2, 5) # Variar tamanho
+print("\nLoading pre-trained GNN_Aval and normalizer...")
+
+# Initialize GNN_Aval model
+HIDDEN_DIM = 64
+NUM_LAYERS = 4
+HEADS = 4
+OUT_DIM = 2
+
+gnn_aval = GNN_Aval(hidden_dim=HIDDEN_DIM, out_dim=OUT_DIM, num_layers=NUM_LAYERS, heads=HEADS)
+
+# Load pre-trained weights
+gnn_aval.load_state_dict(torch.load("gnn_aval_pretrained.pth"))
+print("GNN_Aval model loaded from 'gnn_aval_pretrained.pth'")
+
+# Load normalizer
+target_normalizer = TargetNormalizer()
+target_normalizer.load_state_dict(torch.load("gnn_aval_normalizer.pth"))
+print("Normalizer loaded from 'gnn_aval_normalizer.pth'")
+
+# Test the loaded model quickly
+print("\nQuick test of loaded GNN_Aval...")
+with torch.no_grad():
+    # Create a dummy sample
+    num_tasks = 10
+    num_vms = 3
     dag = generate_workflow_dag(num_tasks)
     num_nodes = dag.number_of_nodes()
-
     time_m, cost_m = generate_cost_time_matrix(num_nodes, num_vms)
-
-    # Força custo/tempo 0 para source/sink
+    
     source_node = list(nx.topological_sort(dag))[0]
     sink_node = list(nx.topological_sort(dag))[-1]
     time_m[source_node, :] = 0
     time_m[sink_node, :] = 0
     cost_m[source_node, :] = 0
     cost_m[sink_node, :] = 0
-
-    # 2. Gerar Alocação (MELHORIA: 1/3 aleatório, 1/3 rápido, 1/3 barato)
-    rand_choice = random.random()
-    if rand_choice < 0.33:
-        alloc_dict = {node_id: random.randint(0, num_vms - 1) for node_id in dag.nodes()}
-    elif rand_choice < 0.66:
-        alloc_dict = heuristic_fastest(dag, time_m)
-    else:
-        alloc_dict = heuristic_cheapest(dag, cost_m)
-
-    # Define alocação de source/sink
+    
+    # Create random allocation
+    alloc_dict = heuristic_random(dag, num_vms)
     alloc_dict[source_node] = 0
     alloc_dict[sink_node] = 0
-
-    # 3. Calcular Métricas Reais (Ground Truth)
-    makespan, total_cost = calculate_metrics(dag, alloc_dict, time_m, cost_m)
-    y_true = torch.tensor([makespan, total_cost], dtype=torch.float32)
-
-    # 4. Criar dados de entrada para GNN_Aval
+    
+    # Calculate real metrics
+    real_makespan, real_cost = calculate_metrics(dag, alloc_dict, time_m, cost_m)
+    
+    # Create PyG data with allocation
     pyg_data = create_pyg_data(dag, time_m, cost_m)
-
+    
     alloc_times = torch.zeros(num_nodes, 1)
     alloc_costs = torch.zeros(num_nodes, 1)
-
     for node_id, vm_id in alloc_dict.items():
-        # A CORREÇÃO DO TypeError VEM AQUI:
         alloc_times[node_id] = torch.tensor(time_m[node_id, vm_id])
         alloc_costs[node_id] = torch.tensor(cost_m[node_id, vm_id])
-
-    # Normalização (simples)
+    
+    # Normalize
     alloc_times = (alloc_times - alloc_times.mean()) / (alloc_times.std() + 1e-6)
     alloc_costs = (alloc_costs - alloc_costs.mean()) / (alloc_costs.std() + 1e-6)
-
-    # Concatena as 6 features base + 2 features de alocação
+    
+    # Concatenate features
     pyg_data['task'].x = torch.cat([pyg_data['task'].x, alloc_times, alloc_costs], dim=1)
+    
+    # Forward pass
+    pred_norm = gnn_aval(pyg_data.x_dict, pyg_data.edge_index_dict, pyg_data.edge_attr_dict)
+    pred_real = target_normalizer.denormalize(pred_norm)
+    
+    print(f"Real: Makespan={real_makespan:.2f}, Cost={real_cost:.2f}")
+    print(f"Predicted: Makespan={pred_real[0,0].item():.2f}, Cost={pred_real[0,1].item():.2f}")
+    print(f"Error: Makespan={abs(pred_real[0,0].item() - real_makespan):.2f} ({abs((pred_real[0,0].item() - real_makespan)/real_makespan*100):.1f}%)")
 
-    return pyg_data, y_true
-
-# --- MELHORIA: Função de Validação ---
-def validate_gnn_aval(model, normalizer, num_samples=100):
-    model.eval() # Coloca o modelo em modo de avaliação
-
-    all_mape_m = [] # Erro percentual do Makespan
-    all_mape_c = [] # Erro percentual do Custo
-
-    with torch.no_grad(): # Não calcula gradientes
-        for _ in range(num_samples):
-            # 1. Gera um novo problema de validação
-            data, y_true_real = create_training_sample_for_aval(num_tasks_base=10, num_vms=3)
-
-            # 2. Faz a predição
-            y_pred_norm = model(data.x_dict, data.edge_index_dict, data.edge_attr_dict)
-
-            # 3. Desnormaliza a predição para comparar com o real
-            y_pred_real = normalizer.denormalize(y_pred_norm.squeeze())
-
-            # 4. Calcula o Erro Percentual Absoluto (MAPE)
-            # (evita divisão por zero se y_true_real for 0)
-            mape_m = torch.abs((y_pred_real[0] - y_true_real[0]) / (y_true_real[0] + 1e-6))
-            mape_c = torch.abs((y_pred_real[1] - y_true_real[1]) / (y_true_real[1] + 1e-6))
-
-            all_mape_m.append(mape_m)
-            all_mape_c.append(mape_c)
-
-    model.train() # Volta ao modo de treino
-
-    # Calcula a acurácia como (1.0 - ErroMédio)
-    avg_mape_m = torch.stack(all_mape_m).mean().item()
-    avg_mape_c = torch.stack(all_mape_c).mean().item()
-
-    acc_m = 100.0 * (1.0 - avg_mape_m)
-    acc_c = 100.0 * (1.0 - avg_mape_c)
-
-    return acc_m, acc_c
-
-# --- Loop de Treinamento GNN_Aval ---
-print("\nIniciando Pré-treinamento da GNN_Aval...")
-
-gnn_aval = GNN_Aval(hidden_dim=HIDDEN_DIM, out_dim=OUT_DIM, num_layers=NUM_LAYERS, heads=HEADS)
-optimizer_aval = optim.Adam(gnn_aval.parameters(), lr=1e-3)
-loss_fn_aval = nn.MSELoss()
-
-# MELHORIA: Normalizador de Alvo
-target_normalizer = TargetNormalizer()
-
-NUM_EPOCHS_AVAL = 850 # Reduzido mas com mais iterações por época
-STEPS_PER_EPOCH_AVAL = 50
-BATCH_SIZE_AVAL = 32 # Aumentado para treinar em lotes maiores
-
-# Listas para armazenar métricas de treino
-train_losses = []
-val_acc_makespan = []
-val_acc_cost = []
-
-for epoch in tqdm(range(NUM_EPOCHS_AVAL)):
-    epoch_loss = 0.0
-
-    # Acumular um lote
-    batch_data = []
-    batch_y_true = []
-    for _ in range(STEPS_PER_EPOCH_AVAL * BATCH_SIZE_AVAL):
-        data, y_true = create_training_sample_for_aval(num_tasks_base=10, num_vms=3)  # Reduzido
-        batch_data.append(data)
-        batch_y_true.append(y_true)
-
-    batch_y_true = torch.stack(batch_y_true)
-    target_normalizer.update(batch_y_true) # Atualiza média/var
-
-    # Normaliza os alvos do lote
-    batch_y_true_norm = target_normalizer.normalize(batch_y_true)
-
-    # Treinar em mini-lotes
-    for i in range(STEPS_PER_EPOCH_AVAL):
-        optimizer_aval.zero_grad()
-
-        # Pega um mini-lote
-        start_idx = i * BATCH_SIZE_AVAL
-        end_idx = start_idx + BATCH_SIZE_AVAL
-        
-        # Como estamos treinando individualmente, vamos processar um por um
-        # mas acumular o gradiente
-        batch_loss = 0
-        for j in range(BATCH_SIZE_AVAL):
-            idx = start_idx + j
-            if idx >= len(batch_data):
-                break
-                
-            data = batch_data[idx]
-            y_true_norm = batch_y_true_norm[idx]
-
-            # Forward pass
-            y_pred_norm = gnn_aval(data.x_dict, data.edge_index_dict, data.edge_attr_dict)
-            loss = loss_fn_aval(y_pred_norm.squeeze(), y_true_norm)
-            loss.backward()
-            batch_loss += loss.item()
-
-        optimizer_aval.step()
-        epoch_loss += batch_loss / BATCH_SIZE_AVAL
-
-    train_losses.append(epoch_loss / STEPS_PER_EPOCH_AVAL)
-
-    if (epoch + 1) % 50 == 0:
-        # MELHORIA: Roda a validação e imprime a acurácia
-        acc_m, acc_c = validate_gnn_aval(gnn_aval, target_normalizer, num_samples=20)
-        val_acc_makespan.append(acc_m)
-        val_acc_cost.append(acc_c)
-        print(f"\nEpoch [{epoch+1}/{NUM_EPOCHS_AVAL}], Loss (MSE): {epoch_loss/STEPS_PER_EPOCH_AVAL:.4f}, "
-              f"Acc. Makespan: {acc_m:.2f}%, Acc. Custo: {acc_c:.2f}%")
-
-print("Pré-treinamento da GNN_Aval concluído.")
-# Plot dos gráficos de treino
-fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-
-# Gráfico 1: Loss de treino
-axes[0].plot(train_losses)
-axes[0].set_xlabel('Época')
-axes[0].set_ylabel('Loss (MSE)')
-axes[0].set_title('Loss de Treino da GNN_Aval')
-axes[0].grid(True)
-
-# Gráfico 2: Acurácia do Makespan
-epochs_val = np.arange(50, NUM_EPOCHS_AVAL + 1, 50)
-axes[1].plot(epochs_val, val_acc_makespan)
-axes[1].set_xlabel('Época')
-axes[1].set_ylabel('Acurácia (%)')
-axes[1].set_title('Acurácia do Makespan (Validação)')
-axes[1].grid(True)
-
-# Gráfico 3: Acurácia do Custo
-axes[2].plot(epochs_val, val_acc_cost)
-axes[2].set_xlabel('Época')
-axes[2].set_ylabel('Acurácia (%)')
-axes[2].set_title('Acurácia do Custo (Validação)')
-axes[2].grid(True)
-
-plt.tight_layout()
-plt.savefig("treino_gnn_aval.png")  # salva a figura
-plt.close()                         # não abre janela
-
-# Salvar o modelo treinado E o normalizador
-torch.save(gnn_aval.state_dict(), "gnn_aval_pretrained.pth")
-torch.save(target_normalizer.state_dict(), "gnn_aval_normalizer.pth")
+print("\nProceeding to GNN_Aloc training...")
 
 # %%
 # ==============================================================================
@@ -752,13 +619,23 @@ class GNN_Aloc(torch.nn.Module):
         return alloc_logits, hard_alloc
 
 # --- Teste do Modelo (Instanciação) ---
+# IMPORTANTE: GNN_Aloc usa apenas as 6 features base (mean, std, min de tempo/custo)
+# GNN_Aval usa 8 features (6 base + 2 de alocação: tempo e custo da VM escolhida)
+# Por isso precisamos pegar apenas as primeiras 6 colunas
+
 NUM_VMS = 3  # Reduzido
 gnn_aloc_model = GNN_Aloc(hidden_dim=HIDDEN_DIM, num_vms=NUM_VMS, num_layers=3, heads=HEADS)
 print("\nEstrutura GNN_Aloc:")
 print(gnn_aloc_model)
 
-# Teste de forward
-logits, hard_alloc = gnn_aloc_model(pyg_data.x_dict, pyg_data.edge_index_dict, pyg_data.edge_attr_dict)
+# Teste de forward - USAR APENAS AS 6 PRIMEIRAS FEATURES
+# Cria uma cópia dos dados e mantém apenas as 6 features originais
+pyg_data_for_aloc = pyg_data.clone()
+pyg_data_for_aloc['task'].x = pyg_data['task'].x[:, :6]  # Apenas as 6 features base
+
+logits, hard_alloc = gnn_aloc_model(pyg_data_for_aloc.x_dict, 
+                                     pyg_data_for_aloc.edge_index_dict, 
+                                     pyg_data_for_aloc.edge_attr_dict)
 print(f"\nSaída Logits GNN_Aloc (shape): {logits.shape}") # (N_tasks, N_vms)
 print(f"Saída Hard Alloc GNN_Aloc (shape): {hard_alloc.shape}") # (N_tasks, N_vms)
 print(f"Exemplo Hard Alloc (task 0): {hard_alloc[0]}") # Deve ser [0., 1., 0.] ou similar
@@ -1216,13 +1093,6 @@ def heuristic_cheapest(dag, cost_m):
         alloc_dict[node_id] = vm_id
     return alloc_dict
 
-def heuristic_random(dag, num_vms):
-    alloc_dict = {}
-    for node_id in dag.nodes():
-        vm_id = random.randint(0, num_vms - 1)
-        alloc_dict[node_id] = vm_id
-    return alloc_dict
-
 # --- Loop de Avaliação ---
 NUM_TEST_PROBLEMS = 100
 results = {
@@ -1352,4 +1222,3 @@ plt.title('Trade-off Makespan vs Custo (100 problemas)')
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.show()
-# %%
